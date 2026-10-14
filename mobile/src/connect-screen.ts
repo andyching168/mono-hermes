@@ -7,7 +7,8 @@
  */
 
 import appIconUrl from './assets/app-icon.png'
-import { type AuthSession, InvalidCredentialsError } from './bridge/auth'
+import { type AuthSession, InvalidCredentialsError, OAuthCancelledError, resolveNousOAuth } from './bridge/auth'
+import { oauthPlatform } from './bridge/native-oauth'
 import { errorMessage, LanCleartextConsentRequired, normalizeBaseUrl } from './bridge/util'
 
 export interface LoginRequest {
@@ -46,6 +47,9 @@ const STYLE = `
 .hm-status{min-height:18px;margin:2px 0 10px;color:#9dc3ff;font-size:13px}
 .hm-btn{width:100%;height:48px;border:0;border-radius:10px;background:#f2f2f2;color:#0a0a0a;font-size:16px;font-weight:600}
 .hm-btn[disabled]{opacity:.55}
+.hm-btn-alt{background:#1e1e1e;border:1px solid #3a3a3a;color:#f2f2f2;margin-top:10px}
+.hm-oauth-hint{margin:8px 0 0;color:#7d7d7d;font-size:12px}
+.hm-oauth-hint[hidden]{display:none}
 .hm-link{display:block;margin:14px auto 0;background:none;border:0;color:#8f8f8f;font-size:13px;text-decoration:underline}
 `
 
@@ -92,6 +96,15 @@ export function createConnectUi(): ConnectUi {
       const error = el('div', { className: 'hm-error', role: 'alert' })
       const button = el('button', { className: 'hm-btn', textContent: 'Connect', type: 'submit' })
 
+      // Nous Portal OAuth: opens the SYSTEM browser (Custom Tab). The Portal credentials are never
+      // typed into this WebView.
+      const nousButton = el('button', {
+        className: 'hm-btn hm-btn-alt',
+        textContent: 'Sign in with Nous',
+        type: 'button'
+      })
+      const nousHint = el('p', { className: 'hm-oauth-hint', hidden: true })
+
       // Shown only after the gateway answered with LanCleartextConsentRequired for a LAN http:// address.
       const consent = el('input', { id: 'hm-lan-consent', name: 'lan-consent', type: 'checkbox' })
 
@@ -122,7 +135,9 @@ export function createConnectUi(): ConnectUi {
         consentBlock,
         status,
         error,
-        button
+        button,
+        nousButton,
+        nousHint
       ])
 
       if (dismissible) {
@@ -148,17 +163,28 @@ export function createConnectUi(): ConnectUi {
         resolve(ok)
       }
 
-      // A new address needs a fresh decision: forget any warning shown for the previous one.
+      // A new address needs a fresh decision: forget any warning shown for the previous one, and
+      // re-show the Nous option (its availability was probed against the old address).
       urlInput.addEventListener('input', () => {
         consentRequired = false
         consentBlock.hidden = true
         consent.checked = false
         button.disabled = false
+        nousButton.disabled = false
+        nousButton.hidden = false
+        nousHint.hidden = true
+        nousHint.textContent = ''
       })
 
-      consent.addEventListener('change', () => {
-        button.disabled = !consent.checked
-      })
+      // Both sign-in buttons live behind the same LAN-cleartext consent gate.
+      const syncDisabled = () => {
+        const blocked = consentRequired && !consent.checked
+
+        button.disabled = blocked
+        nousButton.disabled = blocked
+      }
+
+      consent.addEventListener('change', syncDisabled)
 
       // Consent is per server: accepted now (checkbox) or at an earlier login for this exact URL.
       const lanCleartextAccepted = (): boolean => {
@@ -173,23 +199,59 @@ export function createConnectUi(): ConnectUi {
         }
       }
 
-      card.addEventListener('submit', async event => {
-        event.preventDefault()
+      /**
+       * Ask the gateway what it advertises (`probeServer`: /api/status `auth_flows` + auth_providers)
+       * so the Nous option reflects reality instead of assuming Portal sign-in exists.
+       */
+      const refreshNousAvailability = async () => {
+        nousHint.hidden = true
+        nousHint.textContent = ''
 
+        if (!urlInput.value.trim()) {
+          return
+        }
+
+        // Unreachable, or LAN cleartext still needing consent: keep the button visible and let the
+        // click report the real reason.
+        const probe = await session.probe(urlInput.value, { allowLanCleartext: lanCleartextAccepted() }).catch(() => null)
+
+        if (!probe) {
+          return
+        }
+
+        const decision = resolveNousOAuth(probe)
+
+        if (decision.available) {
+          nousHint.textContent = 'This server offers Nous Portal sign-in.'
+        } else {
+          nousButton.hidden = true
+          nousHint.textContent = decision.reason
+        }
+
+        nousHint.hidden = false
+      }
+
+      urlInput.addEventListener('blur', () => void refreshNousAvailability())
+
+      const signIn = async (method: 'nous' | 'password') => {
         if (consentRequired && !consent.checked) {
           return
         }
 
         error.textContent = ''
         button.disabled = true
-        status.textContent = 'Contacting the server...'
+        nousButton.disabled = true
+        status.textContent = method === 'nous' ? 'Opening the Nous Portal sign-in...' : 'Contacting the server...'
 
         try {
-          await session.login(
-            urlInput.value,
-            { password: passInput.value, username: userInput.value.trim() },
-            { allowLanCleartext: lanCleartextAccepted() }
-          )
+          const policy = { allowLanCleartext: lanCleartextAccepted() }
+
+          if (method === 'nous') {
+            await session.loginWithNous(urlInput.value, { platform: oauthPlatform }, policy)
+          } else {
+            await session.login(urlInput.value, { password: passInput.value, username: userInput.value.trim() }, policy)
+          }
+
           finish(true)
         } catch (failure) {
           status.textContent = ''
@@ -197,17 +259,31 @@ export function createConnectUi(): ConnectUi {
           if (failure instanceof LanCleartextConsentRequired) {
             consentRequired = true
             consentBlock.hidden = false
-            button.disabled = !consent.checked
+            syncDisabled()
             consent.focus()
 
             return
           }
 
-          error.textContent = failure instanceof InvalidCredentialsError ? failure.message : errorMessage(failure)
-          button.disabled = consentRequired && !consent.checked
-          passInput.select()
+          error.textContent =
+            failure instanceof OAuthCancelledError || failure instanceof InvalidCredentialsError
+              ? failure.message
+              : errorMessage(failure)
+
+          syncDisabled()
+
+          if (method === 'password') {
+            passInput.select()
+          }
         }
+      }
+
+      card.addEventListener('submit', event => {
+        event.preventDefault()
+        void signIn('password')
       })
+
+      nousButton.addEventListener('click', () => void signIn('nous'))
     })
 
   return {

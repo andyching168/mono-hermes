@@ -9,6 +9,7 @@ Capacitor-backed implementation of it **before** importing the untouched
 |---|---|
 | `install.ts` | Typed composition root. The literal is checked against upstream's `Window['hermesDesktop']`, so a new required member upstream is a **compile error** (drift detection). |
 | `auth.ts` | Native bearer login (below), refresh, single-flight rotation. |
+| `native-oauth.ts` | Nous Portal OAuth: system browser (Custom Tab) + the native `OAuthLoopback` plugin. |
 | `api.ts` | `api()` = Electron's `hermes:api`: bearer REST, `?profile=` scoping, `"<status>: <body>"` errors. |
 | `gateway-ws.ts` | Mints a fresh single-use ticket per WebSocket dial. |
 | `platform.ts`, `local-files.ts`, `media.ts` | Browser, clipboard, notifications, mic, keep-awake, downloads/share, file picker, `hermes-media://`. |
@@ -28,6 +29,45 @@ The gateway brokers a native-app flow that works for the password provider witho
 `code`+`state` -> `POST /auth/native/token` yields `access_token`/`refresh_token`. REST then uses
 `Authorization: Bearer`, refreshing through `/auth/native/refresh` on expiry or 401. WebSockets use
 `POST /api/auth/ws-ticket` -> `/api/ws?ticket=` (30 s, single use, never cached).
+
+### Nous Portal OAuth (the `nous` provider)
+
+The password flow gets away with a loopback URI nothing listens on because the gateway hands that
+URL back inside a JSON body. Portal sign-in cannot: the gateway 302s the **system browser** to the
+redirect URI, so a real listener is required. The gateway is also the authority on which redirect
+URI it accepts - `_validate_loopback_redirect_uri` (hermes_cli/dashboard_auth/routes.py) rejects
+everything except `http://` on a canonical loopback IP literal:
+
+| Tempting Android option | Gateway answer |
+|---|---|
+| `com.hermesmovil.app://oauth` (custom scheme) | 400 - scheme must be `http` |
+| `https://…/auth/callback` (App Link) | 400 - host must be a loopback IP literal |
+| `http://localhost:PORT/…` | 400 - `localhost` is refused in favour of IP literals (RFC 8252 §8.3) |
+| `http://127.0.0.1:PORT/<path>` | accepted |
+
+So the only supported Android redirect is a real loopback listener (`isGatewayLoopbackRedirectUri`
+in `auth.ts` mirrors the rule and is checked before the browser is opened):
+
+1. The native `OAuthLoopback` plugin (`android/.../oauth/`) binds `ServerSocket(0)` on `127.0.0.1`
+   only and reports an ephemeral `redirect_uri` - no fixed port is assumed, and nothing is exposed
+   to the LAN.
+2. `@capacitor/browser` opens `GET /auth/native/authorize?provider=nous&code_challenge=…` in a
+   Custom Tab, so the Portal credentials are typed into the real browser, never a WebView the app
+   controls.
+3. The gateway brokers to Portal and 302s the browser back to the loopback URI with
+   `?code=…&state=…`; the listener captures it, answers the tab, and the tab is closed.
+4. The same `state` check, `/auth/native/token` exchange, `/auth/native/refresh` rotation and
+   `AuthSession` bookkeeping as the password flow.
+
+`POST /auth/native/authorize` is a pre-auth route, so the listener accepts only GET on the exact
+callback path and only with `Host` equal to the authority it bound (a DNS-rebinding page can reach
+`127.0.0.1` but cannot forge that header). Dismissing the tab cancels promptly via `browserFinished`
+instead of waiting out the timeout.
+
+The connect screen offers **Sign in with Nous** only when `probeServer()` finds `native_pkce` in
+`/api/status` `auth_flows` AND a `nous` entry in `/api/auth/providers` (`resolveNousOAuth`); the
+`nous` provider registers only when the PC has `dashboard.oauth.client_id` /
+`HERMES_DASHBOARD_OAUTH_CLIENT_ID` set. **Username & password keeps working unchanged.**
 
 ## Why native HTTP instead of `fetch`
 
