@@ -180,6 +180,18 @@ adb install -r ../apk/mono-hermes-<version>-debug.apk   # debug build (WebView d
 node ui-audit/device-smoke.mjs                     # terminal 2
 ```
 
+OAuth callback check (emulator or phone, debug APK, **no gateway needed**): `node ui-audit/device-oauth.mjs`
+asserts that the native `OAuthLoopback` plugin binds an ephemeral `127.0.0.1` port, that a **real Custom Tab**
+navigating to that `redirect_uri` reaches the listener with `?code=..&state=..`, that a stray path does not
+consume the flow, and that `stop()` releases the port. This is the one hop the unit suite cannot reach, and the
+gateway accepts no other redirect URI (the Nous Portal section above), so it is checked on real hardware.
+
+```
+cd mobile
+adb install -r android/app/build/outputs/apk/debug/app-debug.apk
+node ui-audit/device-oauth.mjs
+```
+
 Rotation (issue #2) is checked twice:
 
 - The `rotation` audit scenario swaps the Playwright viewport between portrait and landscape with the

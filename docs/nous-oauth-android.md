@@ -147,25 +147,53 @@ with rotation, sign-out). An OAuth session is stored and behaves identically to 
 | Probe detection | *detects the nous provider and native_pkce from /api/status + /api/auth/providers* |
 | Redirect parity | *accepts exactly what `_validate_loopback_redirect_uri` accepts* / *refuses every redirect the gateway refuses* |
 
-## 7. Unverified risks
+## 7. Device verification
+
+`mobile/ui-audit/device-oauth.mjs` runs against a real device (or emulator) with the debug APK
+installed and **no gateway at all** - it exercises the app's own native side plus a real Custom Tab:
+
+```
+cd mobile
+adb install -r android/app/build/outputs/apk/debug/app-debug.apk
+node ui-audit/device-oauth.mjs
+```
+
+Result on a Xiaomi 2407FPN8EG (Android 16 / API 36, arm64-v8a):
+
+| Check | Result |
+|---|---|
+| native `OAuthLoopback` + `Browser` plugins registered | ok |
+| connect screen offers "Sign in with Nous" (visible, 48px, in a 375×834 viewport) | ok |
+| `OAuthLoopback.start()` binds an ephemeral loopback port, canonical URI | ok - `http://127.0.0.1:35989/hermes-mobile/oauth/callback` |
+| **a real Custom Tab reaches the loopback listener with `code`+`state`** | ok |
+| a stray path does not consume the flow | ok |
+| `stop()` releases the listener | ok |
+
+This settles the highest-value assumption: a real Android Custom Tab really does navigate to
+`http://127.0.0.1:<port>/...` and reach the app's own `ServerSocket` (risk 2 below, now closed). An
+earlier manual run captured the Custom Tab rendering the listener's page at `127.0.0.1:44685`, and
+the same run drove the app's connect screen with the server URL / username / password fields and both
+buttons laid out correctly.
+
+## 8. Unverified risks
 
 Everything below is honestly **not** proven by the test suite or by this environment. They are the
 things to check before shipping.
 
 1. **No real end-to-end run against a live Portal.** The suite uses a scripted transport and a
-   scripted platform. No test in this change contacts a real `hermes serve`, a real Nous Portal, or
-   a real Custom Tab. The gateway contracts above are read from source, not observed.
-2. **Chrome/WebView behaviour on a top-level navigation to `http://127.0.0.1:<port>` was not
-   executed on a device.** It is expected to work (loopback is an ordinary http origin and this is
-   the RFC 8252 pattern the desktop uses), but Private Network Access policy, a future Chrome
-   change, or a hardened WebView could interfere. This is the single highest-value thing to verify
-   on a real device/emulator against a real gated gateway.
+   scripted platform, and the device check above drives the plugin/Custom-Tab hop directly. Nothing
+   in this change has contacted a real `hermes serve` or a real Nous Portal. The gateway contracts
+   above are read from source, not observed.
+2. ~~Chrome/WebView behaviour on a top-level navigation to `http://127.0.0.1:<port>`~~ - **verified**
+   on a real device (§7); the Custom Tab reaches the app's loopback listener. Private Network Access
+   policy or a future Chrome change could still break it, so re-run `ui-audit/device-oauth.mjs` when
+   bumping Android/Chrome targets.
 3. **Custom Tabs availability.** `@capacitor/browser` falls back to `ACTION_VIEW` when no Custom
    Tabs provider exists; that path is untested here, as is the behaviour of `browserFinished`
    (which drives prompt cancellation). If the listener is unaware, cancel degrades to the timeout.
 4. **The app process must stay alive** while the browser is in front. Nothing pins it; if Android
    kills the process, the socket dies and the callback is lost (the user retries; the gateway's
-   pending entry simply expires after 600 s).
+   pending entry simply expires after 600 s). The device check above used a foregrounded app.
 5. **The `nous` provider only exists when the PC is configured** (`dashboard.oauth.client_id` /
    `HERMES_DASHBOARD_OAUTH_CLIENT_ID`, shape `agent:{instance_id}`). A gateway without it is
    correctly handled (the option is hidden with a reason), but that means the feature cannot be
