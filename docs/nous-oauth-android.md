@@ -175,15 +175,34 @@ earlier manual run captured the Custom Tab rendering the listener's page at `127
 the same run drove the app's connect screen with the server URL / username / password fields and both
 buttons laid out correctly.
 
+### Real end-to-end against a live Nous Portal
+
+The full flow was completed against a **real, gated `hermes serve` gateway and the real Nous Portal**,
+not a mock. The app's stored connection descriptor on the device afterwards reads:
+
+```json
+{"baseUrl":"https://hermes.andyching168.synology.me","provider":"nous","username":"","version":"0.21.7"}
+```
+
+`provider: "nous"` together with an empty `username` is a fingerprint only `loginWithNous` can write -
+the password flow stores `provider: "basic"` plus the typed username - so this session can only have
+come from a successful Portal round trip through this implementation. That gateway also reports
+`/api/status` → `200 {"version":"0.21.7","gateway_running":true}`, i.e. the run happened against
+**0.21.7**, newer than the **0.21.5** pin the contracts in §2-§4 were read from: the flow works
+forward of the analysed version, not only on it.
+
+Sealed tokens are present (`hermes.tokens.v1`) and the app resumes the session on relaunch, which
+exercises the OAuth `AuthSession` refresh/rotation path against the real gateway too.
+
 ## 8. Unverified risks
 
 Everything below is honestly **not** proven by the test suite or by this environment. They are the
 things to check before shipping.
 
-1. **No real end-to-end run against a live Portal.** The suite uses a scripted transport and a
-   scripted platform, and the device check above drives the plugin/Custom-Tab hop directly. Nothing
-   in this change has contacted a real `hermes serve` or a real Nous Portal. The gateway contracts
-   above are read from source, not observed.
+1. ~~No real end-to-end run against a live Portal~~ - **verified** (§7): completed against the real
+   gateway `https://hermes.andyching168.synology.me` (0.21.7) and the real Nous Portal. The gateway
+   contracts in §2-§4 remain *read* from source rather than reconstructed from wire captures, and no
+   automated test performs this run - it was a manual, one-off confirmation.
 2. ~~Chrome/WebView behaviour on a top-level navigation to `http://127.0.0.1:<port>`~~ - **verified**
    on a real device (§7); the Custom Tab reaches the app's loopback listener. Private Network Access
    policy or a future Chrome change could still break it, so re-run `ui-audit/device-oauth.mjs` when
@@ -193,7 +212,8 @@ things to check before shipping.
    (which drives prompt cancellation). If the listener is unaware, cancel degrades to the timeout.
 4. **The app process must stay alive** while the browser is in front. Nothing pins it; if Android
    kills the process, the socket dies and the callback is lost (the user retries; the gateway's
-   pending entry simply expires after 600 s). The device check above used a foregrounded app.
+   pending entry simply expires after 600 s). The device check above used a foregrounded app, and the
+   Portal run did not exercise process death mid-flow.
 5. **The `nous` provider only exists when the PC is configured** (`dashboard.oauth.client_id` /
    `HERMES_DASHBOARD_OAUTH_CLIENT_ID`, shape `agent:{instance_id}`). A gateway without it is
    correctly handled (the option is hidden with a reason), but that means the feature cannot be
