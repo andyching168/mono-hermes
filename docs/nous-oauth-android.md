@@ -191,8 +191,13 @@ come from a successful Portal round trip through this implementation. That gatew
 **0.21.7**, newer than the **0.21.5** pin the contracts in §2-§4 were read from: the flow works
 forward of the analysed version, not only on it.
 
-Sealed tokens are present (`hermes.tokens.v1`) and the app resumes the session on relaunch, which
-exercises the OAuth `AuthSession` refresh/rotation path against the real gateway too.
+Sealed tokens are present (`hermes.tokens.v1`) and the app resumes the session on relaunch. The
+session is live against that gateway - `GET /api/auth/me` returns `provider: "nous"` with an
+unexpired access token (~14 min remaining, matching Portal's short access-token lifetime, so a
+long-lived session depends on `/auth/native/refresh` rotation continuing to work) and the app reports
+the gateway as ready. Note that the app's authenticated requests and its readiness probe both fail
+while the phone's screen is locked (Android suspends the app's network), which looks exactly like
+"gateway offline"; unlock before diagnosing a connection.
 
 ## 8. Unverified risks
 
