@@ -1,9 +1,11 @@
 /**
  * Native (RFC 8252 style) bearer login against a gated `hermes serve` gateway.
  *
- * Desktop opens the system browser and runs a loopback listener. A phone cannot
- * do either, but the gateway's broker makes that unnecessary for password
- * providers:
+ * Two login methods share one token layer:
+ *
+ *   A. Username & password (the `basic` provider) - no browser needed. Desktop opens
+ *      the system browser and runs a loopback listener; a phone cannot do either, but
+ *      the gateway's broker makes that unnecessary for password providers:
  *
  *   1. GET  /auth/native/authorize?provider=..&code_challenge=..&redirect_uri=<loopback>&state=..
  *        -> 302 /login + a PKCE cookie holding the server-side broker handle
@@ -12,6 +14,24 @@
  *           (never followed - we only read code/state out of it)
  *   3. POST /auth/native/token {code, code_verifier}  -> {access_token, refresh_token, expires_at}
  *   4. POST /auth/native/refresh {refresh_token, provider} rotates the pair.
+ *
+ *      Step 2 is why this flow can get away with a loopback URI nothing listens on: the
+ *      gateway *returns* that URL inside a JSON body, so `next` can simply be parsed. See
+ *      NATIVE_REDIRECT_URI.
+ *
+ *   B. Nous Portal OAuth (the `nous` provider) - needs a real browser AND a real listener,
+ *      because now the gateway 302s the *system browser* to the redirect URI:
+ *
+ *   1. Bind a loopback socket (native `OAuthLoopback` plugin) -> http://127.0.0.1:<port>/...
+ *   2. Open the authorize URL in the system browser / Custom Tab (never a WebView we control,
+ *      so the Portal credentials are typed into the real browser).
+ *   3. The gateway brokers to Portal, then 302s the browser back to the loopback URI with
+ *      ?code=..&state=..; the listener captures it and the tab is closed.
+ *   4. Steps 3-4 above (token exchange + refresh) are shared verbatim with flow A.
+ *
+ * The gateway is the authority on what redirect URI it will accept: it must be `http://` on a
+ * canonical loopback IP literal. `isGatewayLoopbackRedirectUri` below mirrors that rule, and no
+ * custom scheme or https App Link can be substituted for it.
  *
  * The cookie only has to survive between step 1 and 2, so a tiny in-memory jar
  * is enough and no browser session cookie is ever stored. REST then uses
@@ -33,8 +53,25 @@ import {
   type TransportPolicyOptions
 } from './util'
 
-/** Syntactically valid loopback redirect; nothing listens on it and it is never fetched. */
+/**
+ * Syntactically valid loopback redirect for the PASSWORD broker flow; nothing listens on it and it
+ * is never fetched, because `POST /auth/password-login` returns it in JSON and we only parse
+ * `code`/`state` out of it.
+ *
+ * It is NOT usable for OAuth: there the gateway 302s the system browser to this exact URI, so a
+ * listener must really exist. `isGatewayLoopbackRedirectUri` accepts its syntax, but only the
+ * native `OAuthLoopback` plugin's own ephemeral `redirectUri` may be used for flow B.
+ */
 export const NATIVE_REDIRECT_URI = 'http://127.0.0.1:47321/hermes-mobile/callback'
+
+/** Provider name the Nous Portal plugin registers under (plugins/dashboard_auth/nous). */
+export const NOUS_PROVIDER_NAME = 'nous'
+
+/** Loopback path our OAuth listener answers on. The gateway constrains the authority, not the path. */
+export const OAUTH_LOOPBACK_PATH = '/hermes-mobile/oauth/callback'
+
+/** The gateway drops a pending native authorization after 600 s; stay comfortably inside that. */
+export const OAUTH_CALLBACK_TIMEOUT_MS = 300_000
 
 const PASSWORD_PROVIDER_NAMES = new Set(['basic'])
 
@@ -67,6 +104,22 @@ export class InvalidCredentialsError extends Error {
   constructor(message = 'Invalid username or password.') {
     super(message)
     this.name = 'InvalidCredentialsError'
+  }
+}
+
+/** The gateway does not offer a `nous` provider (or is not gated / lacks native_pkce). */
+export class NousProviderUnavailableError extends Error {
+  constructor(message: string) {
+    super(message)
+    this.name = 'NousProviderUnavailableError'
+  }
+}
+
+/** The user backed out of the browser (or the authorization server refused silently). */
+export class OAuthCancelledError extends Error {
+  constructor(message = 'Sign-in was cancelled.') {
+    super(message)
+    this.name = 'OAuthCancelledError'
   }
 }
 
@@ -175,6 +228,144 @@ export async function probeServer(
     providers,
     version: typeof body.version === 'string' ? body.version : null
   }
+}
+
+/** Case-insensitive provider lookup on a probe result. */
+export function findAuthProvider(probe: ServerProbe, name: string): AuthProviderInfo | null {
+  const wanted = name.trim().toLowerCase()
+
+  return probe.providers.find(provider => provider.name.toLowerCase() === wanted) ?? null
+}
+
+export type NousOAuthDecision = { available: true } | { available: false; reason: string }
+
+/**
+ * Decide whether Nous Portal sign-in is offered, and say precisely why not when it is not.
+ *
+ * Mirrors upstream `resolveLoginStrategy`: the native flow needs `native_pkce` on /api/status AND a
+ * non-password provider, and `oauthGuardMayHardFail` treats "all providers are password-based" as
+ * "this gateway does not speak OAuth". The `nous` provider only registers when the operator
+ * configured `dashboard.oauth.client_id` / `HERMES_DASHBOARD_OAUTH_CLIENT_ID`, so a gateway that
+ * only has `basic` legitimately has no Portal sign-in to offer.
+ */
+export function resolveNousOAuth(probe: ServerProbe): NousOAuthDecision {
+  if (!probe.authRequired) {
+    return { available: false, reason: 'This Hermes server is not running in gated mode, so there is nothing to sign in to.' }
+  }
+
+  if (!probe.nativeFlow) {
+    return {
+      available: false,
+      reason:
+        'This Hermes server does not advertise the native_pkce flow. Update Hermes on the PC (hermes update) and restart "hermes serve".'
+    }
+  }
+
+  const nous = findAuthProvider(probe, NOUS_PROVIDER_NAME)
+
+  if (!nous || nous.supportsPassword) {
+    return {
+      available: false,
+      reason:
+        'This Hermes server does not offer Nous Portal sign-in (no "nous" provider). ' +
+        'Set dashboard.oauth.client_id on the PC, or sign in with username & password.'
+    }
+  }
+
+  return { available: true }
+}
+
+/**
+ * Loopback hosts the gateway accepts, spelled exactly as `_validate_loopback_redirect_uri`
+ * requires. Keyed by WHATWG `URL.hostname`, which reports an IPv6 literal *with* its brackets.
+ */
+const GATEWAY_LOOPBACK_AUTHORITIES: Record<string, string> = { '127.0.0.1': '127.0.0.1', '[::1]': '[::1]' }
+
+/**
+ * Gate a redirect URI through the same rules the gateway applies in
+ * `_validate_loopback_redirect_uri` (hermes_cli/dashboard_auth/routes.py):
+ *
+ *   - ASCII printable only (no controls, no space, no backslash)
+ *   - scheme exactly `http` - so a custom scheme like `com.hermesmovil.app://oauth` can never be
+ *     registered as a workaround
+ *   - host a loopback IP literal spelled canonically (`localhost` is explicitly refused, and so is
+ *     every `https://` App Link)
+ *   - no fragment, no userinfo, canonical authority spelling (`:00080` or an upper-case host would
+ *     be a 400). A query string IS preserved by the gateway, so we accept one too.
+ *
+ * Checked before the browser is opened, so a misconfigured listener fails locally with a clear
+ * message instead of bouncing the user to an opaque gateway 400.
+ */
+export function isGatewayLoopbackRedirectUri(raw: string): boolean {
+  if (!raw || !/^[\x21-\x7e]+$/.test(raw) || raw.includes('\\') || raw.includes('#')) {
+    return false
+  }
+
+  let parsed: URL
+
+  try {
+    parsed = new URL(raw)
+  } catch {
+    return false
+  }
+
+  if (parsed.protocol !== 'http:' || parsed.username || parsed.password || !parsed.pathname.startsWith('/')) {
+    return false
+  }
+
+  const canonicalHost = GATEWAY_LOOPBACK_AUTHORITIES[parsed.hostname]
+
+  if (!canonicalHost) {
+    return false
+  }
+
+  const canonicalAuthority = parsed.port ? `${canonicalHost}:${parsed.port}` : canonicalHost
+
+  // Compare the *raw* authority too: the URL parser would silently canonicalise ":00080", both of
+  // which the gateway rejects (it compares `parsed.netloc` against its canonical spelling).
+  const rawAuthority = raw.replace(/^[a-z][a-z0-9+.-]*:\/\//i, '').split(/[/?#]/, 1)[0]
+
+  return rawAuthority === canonicalAuthority
+}
+
+export function assertGatewayLoopbackRedirectUri(raw: string): string {
+  if (!isGatewayLoopbackRedirectUri(raw)) {
+    throw new Error(
+      `The Hermes gateway only accepts a canonical loopback redirect URI (http://127.0.0.1:<port>/...), got ${raw || 'nothing'}.`
+    )
+  }
+
+  return raw
+}
+
+/**
+ * The Android side of the OAuth login, injected so the flow is testable without a device.
+ * Production uses `oauthPlatform` in native-oauth.ts (Custom Tab + the native `OAuthLoopback`
+ * plugin).
+ */
+export interface OAuthLoopbackHandle {
+  /** Canonical `http://127.0.0.1:<port><path>` the gateway will send the browser back to. */
+  redirectUri: string
+  /** Raw request target the browser asked for; rejects with {@link OAuthCancelledError} on cancel. */
+  awaitCallback(): Promise<string>
+  close(): Promise<void>
+}
+
+export interface OAuthPlatform {
+  /** Open the authorize URL in the system browser; resolves to a closer for that tab. */
+  openBrowser(url: string): Promise<() => Promise<void>>
+  openLoopback(path: string, timeoutMs: number): Promise<OAuthLoopbackHandle>
+}
+
+export interface OAuthLoginDeps {
+  platform: OAuthPlatform
+}
+
+/** Authorization-server refusals that mean "the user did not complete sign-in", not a real failure. */
+const OAUTH_CANCELLATION_CODES = /access_denied|login_required|consent_required|interaction_required|user_cancelled|user_canceled/i
+
+export function isOAuthCancellation(error: unknown): boolean {
+  return error instanceof OAuthCancelledError || OAUTH_CANCELLATION_CODES.test(errorMessage(error))
 }
 
 export function parseTokenResponse(body: any): TokenSet {
@@ -321,6 +512,14 @@ export async function passwordLogin(
   const { code } = parseLoopbackCallback(loginBody.next, state)
 
   // 3. Redeem the one-time code with the PKCE verifier.
+  return redeemNativeCode(transport, baseUrl, code, verifier)
+}
+
+/**
+ * Step 3 of both login flows: exchange the one-time gateway code + PKCE verifier for a token set.
+ * Shared so the password and OAuth flows cannot drift apart on the token contract.
+ */
+async function redeemNativeCode(transport: HttpTransport, baseUrl: string, code: string, verifier: string): Promise<TokenSet> {
   const token = await transport.request({
     json: { code, code_verifier: verifier },
     method: 'POST',
@@ -333,6 +532,65 @@ export async function passwordLogin(
   }
 
   return parseTokenResponse(parseJson(token.body))
+}
+
+/**
+ * Nous Portal OAuth login (flow B): system browser + a REAL loopback listener + PKCE.
+ *
+ * Reuses the same PKCE pair, `state` verification, token exchange and downstream refresh as the
+ * password flow. Nothing here invents an endpoint: the gateway's `/auth/native/authorize` brokers
+ * Portal itself and hands back the same one-time `code`.
+ */
+export async function nousOAuthLogin(
+  transport: HttpTransport,
+  probe: ServerProbe,
+  deps: OAuthLoginDeps
+): Promise<TokenSet> {
+  const decision = resolveNousOAuth(probe)
+
+  if (!decision.available) {
+    throw new NousProviderUnavailableError(decision.reason)
+  }
+
+  const verifier = randomBase64url(32)
+  const state = randomBase64url(24)
+  const challenge = await s256Challenge(verifier)
+
+  // Bind BEFORE opening the browser: the gateway needs the port, and the socket must be listening
+  // by the time the redirect comes back.
+  const listener = await deps.platform.openLoopback(OAUTH_LOOPBACK_PATH, OAUTH_CALLBACK_TIMEOUT_MS)
+  let closeBrowser: (() => Promise<void>) | null = null
+
+  try {
+    assertGatewayLoopbackRedirectUri(listener.redirectUri)
+
+    closeBrowser = await deps.platform.openBrowser(
+      buildNativeAuthorizeUrl(probe.baseUrl, {
+        challenge,
+        provider: NOUS_PROVIDER_NAME,
+        redirectUri: listener.redirectUri,
+        state
+      })
+    )
+
+    // The gateway 302s the browser here after Portal redirects back to /auth/callback.
+    const callbackUrl = await listener.awaitCallback()
+
+    // Same CSRF check as the password flow: a code that arrives with the wrong `state` is never
+    // redeemed.
+    const { code } = parseLoopbackCallback(callbackUrl, state)
+
+    return await redeemNativeCode(transport, probe.baseUrl, code, verifier)
+  } catch (error) {
+    throw isOAuthCancellation(error) ? new OAuthCancelledError() : error
+  } finally {
+    // Always drop the listener (the port must not outlive the flow) and close our tab.
+    await listener.close().catch(() => undefined)
+
+    if (closeBrowser) {
+      await closeBrowser().catch(() => undefined)
+    }
+  }
 }
 
 /** Rotate the token pair. Throws NeedsLoginError when the refresh token is rejected. */
@@ -376,8 +634,15 @@ export class AuthSession {
     private readonly nowSeconds: () => number = () => Date.now() / 1000
   ) {}
 
-  async requireBaseUrl(): Promise<string> {
-    const connection = await this.store.getConnection()
+  /**
+   * Public capability probe so the connect screen can offer the right sign-in options before the
+   * user picks one (`/api/status` + `/api/auth/providers`; credential-free).
+   */
+  async probe(rawUrl: string, policy: TransportPolicyOptions = {}): Promise<ServerProbe> {
+    return probeServer(this.transport, rawUrl, policy)
+  }
+
+  async requireBaseUrl(): Promise<string> {    const connection = await this.store.getConnection()
 
     if (!connection) {
       throw new NeedsLoginError('No Hermes server configured. Connect to your PC first.')
@@ -397,6 +662,33 @@ export class AuthSession {
       lanCleartextAcceptedFor: policy.allowLanCleartext && isLanCleartext(probe.baseUrl) ? probe.baseUrl : undefined,
       provider,
       username: input.username,
+      version: probe.version ?? undefined
+    })
+    await this.store.setTokens({ ...tokens, provider })
+
+    return probe
+  }
+
+  /**
+   * Probe, run the Nous Portal OAuth flow and persist the same descriptor + token pair as
+   * {@link login}. The rest of the session (refresh, 401 retry, sign-out) is unchanged, so an
+   * OAuth session and a password session behave identically once stored.
+   */
+  async loginWithNous(
+    rawUrl: string,
+    deps: OAuthLoginDeps,
+    policy: TransportPolicyOptions = {}
+  ): Promise<ServerProbe> {
+    const probe = await probeServer(this.transport, rawUrl, policy)
+    const tokens = await nousOAuthLogin(this.transport, probe, deps)
+    const provider = tokens.provider || NOUS_PROVIDER_NAME
+
+    await this.store.setConnection({
+      baseUrl: probe.baseUrl,
+      lanCleartextAcceptedFor: policy.allowLanCleartext && isLanCleartext(probe.baseUrl) ? probe.baseUrl : undefined,
+      provider,
+      // OAuth has no username to pre-fill; the identity lives in the token's user_id.
+      username: '',
       version: probe.version ?? undefined
     })
     await this.store.setTokens({ ...tokens, provider })
